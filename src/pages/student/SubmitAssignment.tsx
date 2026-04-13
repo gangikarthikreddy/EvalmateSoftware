@@ -18,6 +18,7 @@ export default function SubmitAssignment() {
   const [assignment, setAssignment] = useState<Tables<"assignments"> | null>(null);
   const [rubrics, setRubrics] = useState<Tables<"rubrics">[]>([]);
   const [existingSubmission, setExistingSubmission] = useState<Tables<"submissions"> | null>(null);
+  const [docUrls, setDocUrls] = useState<Record<string, string>>({});
 
   const [textContent, setTextContent] = useState("");
   const [codeContent, setCodeContent] = useState("");
@@ -28,11 +29,28 @@ export default function SubmitAssignment() {
     if (!assignmentId || !user) return;
     const load = async () => {
       const { data: a } = await supabase.from("assignments").select("*").eq("id", assignmentId).single();
-      setAssignment(a);
+      setAssignment(a as any);
       const { data: r } = await supabase.from("rubrics").select("*").eq("assignment_id", assignmentId).order("sort_order");
-      setRubrics(r || []);
+      setRubrics((r as any) || []);
       const { data: s } = await supabase.from("submissions").select("*").eq("assignment_id", assignmentId).eq("student_id", user.id).maybeSingle();
       setExistingSubmission(s);
+
+      const urls: Record<string, string> = {};
+      if ((a as any)?.problem_file_path) {
+        const { data } = await supabase.storage.from("instructor-docs").createSignedUrl((a as any).problem_file_path, 3600);
+        if (data?.signedUrl) urls.problem = data.signedUrl;
+      }
+      if ((a as any)?.criteria_file_path) {
+        const { data } = await supabase.storage.from("instructor-docs").createSignedUrl((a as any).criteria_file_path, 3600);
+        if (data?.signedUrl) urls.criteria = data.signedUrl;
+      }
+      for (const rubric of r || []) {
+        if ((rubric as any).criteria_file_path) {
+          const { data } = await supabase.storage.from("instructor-docs").createSignedUrl((rubric as any).criteria_file_path, 3600);
+          if (data?.signedUrl) urls[rubric.id] = data.signedUrl;
+        }
+      }
+      setDocUrls(urls);
     };
     load();
   }, [assignmentId, user]);
@@ -44,7 +62,7 @@ export default function SubmitAssignment() {
     try {
       let fileUrl = null;
       if (file) {
-        const path = `${user.id}/${assignmentId}/${file.name}`;
+        const path = `${user.id}/${assignmentId}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
         const { error: uploadErr } = await supabase.storage.from("submissions").upload(path, file, { upsert: true });
         if (uploadErr) throw uploadErr;
         fileUrl = path;
@@ -62,14 +80,9 @@ export default function SubmitAssignment() {
       const { error } = await supabase.from("submissions").insert(payload);
       if (error) throw error;
 
-      toast.success("Submitted! AI grading will begin shortly.");
-      
-      // Trigger auto-grading
+      toast.success("Submitted. AI grading will start.");
       const { data: sub } = await supabase.from("submissions").select("id").eq("assignment_id", assignmentId).eq("student_id", user.id).order("created_at", { ascending: false }).limit(1).single();
-      if (sub) {
-        supabase.functions.invoke("grade-submission", { body: { submissionId: sub.id } }).catch(console.error);
-      }
-      
+      if (sub) supabase.functions.invoke("grade-submission", { body: { submissionId: sub.id } }).catch(console.error);
       navigate("/my-grades");
     } catch (err: any) {
       toast.error(err.message);
@@ -87,16 +100,27 @@ export default function SubmitAssignment() {
         {assignment.type} · Max {assignment.max_score} pts
         {assignment.due_date && ` · Due ${new Date(assignment.due_date).toLocaleDateString()}`}
       </div>
-      {assignment.description && <p className="mb-6 text-muted-foreground">{assignment.description}</p>}
+      {assignment.description && <p className="mb-6 text-muted-foreground whitespace-pre-wrap">{assignment.description}</p>}
+
+      {(docUrls.problem || docUrls.criteria) && (
+        <Card className="mb-6">
+          <CardHeader><CardTitle className="text-base">Assignment Documents</CardTitle></CardHeader>
+          <CardContent className="flex flex-wrap gap-2">
+            {docUrls.problem && <a href={docUrls.problem} target="_blank" rel="noreferrer"><Button variant="outline" size="sm">Open Problem File</Button></a>}
+            {docUrls.criteria && <a href={docUrls.criteria} target="_blank" rel="noreferrer"><Button variant="outline" size="sm">Open Criteria File</Button></a>}
+          </CardContent>
+        </Card>
+      )}
 
       <Card className="mb-6">
         <CardHeader><CardTitle className="text-base">Rubric Criteria</CardTitle></CardHeader>
         <CardContent className="space-y-2">
           {rubrics.map(r => (
-            <div key={r.id} className="flex justify-between items-start">
+            <div key={r.id} className="flex justify-between items-start gap-4">
               <div>
                 <div className="text-sm font-medium">{r.criterion}</div>
-                {r.description && <div className="text-xs text-muted-foreground">{r.description}</div>}
+                {r.description && <div className="text-xs text-muted-foreground whitespace-pre-wrap">{r.description}</div>}
+                {docUrls[r.id] && <a href={docUrls[r.id]} target="_blank" rel="noreferrer" className="text-xs text-primary underline">Open criterion file</a>}
               </div>
               <Badge variant="secondary">{r.max_points} pts</Badge>
             </div>
@@ -107,11 +131,9 @@ export default function SubmitAssignment() {
       {existingSubmission ? (
         <Card>
           <CardContent className="py-6">
-            <p className="text-center text-muted-foreground">You've already submitted this assignment.</p>
+            <p className="text-center text-muted-foreground">You already submitted this assignment.</p>
             <p className="text-center text-sm mt-1">Status: <span className="capitalize font-medium">{existingSubmission.status.replace(/_/g, " ")}</span></p>
-            {existingSubmission.total_score != null && (
-              <p className="text-center text-lg font-bold mt-2">{existingSubmission.total_score}/{existingSubmission.max_possible_score}</p>
-            )}
+            {existingSubmission.total_score != null && <p className="text-center text-lg font-bold mt-2">{existingSubmission.total_score}/{existingSubmission.max_possible_score}</p>}
           </CardContent>
         </Card>
       ) : (
@@ -125,14 +147,8 @@ export default function SubmitAssignment() {
           {assignment.type === "code" && (
             <div className="space-y-2">
               <Label>Your Code {assignment.programming_language && `(${assignment.programming_language})`}</Label>
-              <Textarea
-                value={codeContent}
-                onChange={e => setCodeContent(e.target.value)}
-                rows={15}
-                required
-                placeholder="Write your code here..."
-                className="font-mono text-sm"
-              />
+              <Textarea value={codeContent} onChange={e => setCodeContent(e.target.value)} rows={15} required placeholder="Write your code here..." className="font-mono text-sm" />
+              <p className="text-xs text-muted-foreground">After grading, the instructor can see the program output directly in the browser.</p>
             </div>
           )}
           {assignment.type === "file" && (
@@ -141,9 +157,7 @@ export default function SubmitAssignment() {
               <Input type="file" onChange={e => setFile(e.target.files?.[0] || null)} required />
             </div>
           )}
-          <Button type="submit" disabled={submitting} className="w-full">
-            {submitting ? "Submitting..." : "Submit Assignment"}
-          </Button>
+          <Button type="submit" disabled={submitting} className="w-full">{submitting ? "Submitting..." : "Submit Assignment"}</Button>
         </form>
       )}
     </div>

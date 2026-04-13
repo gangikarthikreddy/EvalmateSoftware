@@ -6,7 +6,7 @@ A modern assignment grading and evaluation platform for instructors and students
 
 - **Frontend**: React + TypeScript + Vite + Tailwind CSS + shadcn/ui
 - **Backend**: Supabase (Auth, Database, Edge Functions)
-- **AI Grading**: OpenAI API (via Supabase Edge Functions)
+- **AI Grading**: GeminiAPI
 
 ## Getting Started
 

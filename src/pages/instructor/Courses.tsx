@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { Plus } from "lucide-react";
+import { Plus, Trash2 } from "lucide-react";
 import type { Tables } from "@/integrations/supabase/types";
 
 export default function Courses() {
@@ -36,6 +36,14 @@ export default function Courses() {
     toast.success("Course created");
     setOpen(false);
     setTitle(""); setDescription(""); setCode("");
+    loadCourses();
+  };
+
+  const deleteCourse = async (course: Tables<"courses">) => {
+    if (!window.confirm(`Delete ${course.title}?`)) return;
+    const { error } = await supabase.from("courses").delete().eq("id", course.id);
+    if (error) { toast.error(error.message); return; }
+    toast.success("Course deleted");
     loadCourses();
   };
 
@@ -69,19 +77,25 @@ export default function Courses() {
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {courses.map(course => (
-          <Link key={course.id} to={`/courses/${course.id}`}>
-            <Card className="hover:shadow-md transition-shadow cursor-pointer">
-              <CardHeader>
-                <div className="text-xs text-muted-foreground font-mono">{course.code}</div>
-                <CardTitle className="text-lg">{course.title}</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground line-clamp-2">{course.description || "No description"}</p>
-              </CardContent>
-            </Card>
-          </Link>
+          <Card key={course.id} className="hover:shadow-md transition-shadow">
+            <CardHeader>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-xs text-muted-foreground font-mono">{course.code}</div>
+                  <CardTitle className="text-lg">{course.title}</CardTitle>
+                </div>
+                <Button variant="ghost" size="icon" onClick={() => deleteCourse(course)}>
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground line-clamp-2 mb-4">{course.description || "No description"}</p>
+              <Link to={`/courses/${course.id}`}><Button className="w-full">Open Course</Button></Link>
+            </CardContent>
+          </Card>
         ))}
-        {courses.length === 0 && <p className="text-muted-foreground col-span-full text-center py-12">No courses yet. Create your first course!</p>}
+        {courses.length === 0 && <p className="text-muted-foreground col-span-full text-center py-12">No courses yet. Create your first course.</p>}
       </div>
     </div>
   );

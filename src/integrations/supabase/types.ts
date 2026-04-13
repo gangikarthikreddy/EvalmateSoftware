@@ -18,10 +18,12 @@ export type Database = {
         Row: {
           course_id: string
           created_at: string
+          criteria_file_path: string | null
           description: string | null
           due_date: string | null
           id: string
           max_score: number
+          problem_file_path: string | null
           programming_language: string | null
           title: string
           type: Database["public"]["Enums"]["assignment_type"]
@@ -30,10 +32,12 @@ export type Database = {
         Insert: {
           course_id: string
           created_at?: string
+          criteria_file_path?: string | null
           description?: string | null
           due_date?: string | null
           id?: string
           max_score?: number
+          problem_file_path?: string | null
           programming_language?: string | null
           title: string
           type?: Database["public"]["Enums"]["assignment_type"]
@@ -42,10 +46,12 @@ export type Database = {
         Update: {
           course_id?: string
           created_at?: string
+          criteria_file_path?: string | null
           description?: string | null
           due_date?: string | null
           id?: string
           max_score?: number
+          problem_file_path?: string | null
           programming_language?: string | null
           title?: string
           type?: Database["public"]["Enums"]["assignment_type"]
@@ -166,6 +172,7 @@ export type Database = {
         Row: {
           avatar_url: string | null
           created_at: string
+          email: string | null
           full_name: string
           id: string
           updated_at: string
@@ -174,6 +181,7 @@ export type Database = {
         Insert: {
           avatar_url?: string | null
           created_at?: string
+          email?: string | null
           full_name?: string
           id?: string
           updated_at?: string
@@ -182,6 +190,7 @@ export type Database = {
         Update: {
           avatar_url?: string | null
           created_at?: string
+          email?: string | null
           full_name?: string
           id?: string
           updated_at?: string
@@ -240,6 +249,7 @@ export type Database = {
         Row: {
           assignment_id: string
           criterion: string
+          criteria_file_path: string | null
           description: string | null
           id: string
           max_points: number
@@ -248,6 +258,7 @@ export type Database = {
         Insert: {
           assignment_id: string
           criterion: string
+          criteria_file_path?: string | null
           description?: string | null
           id?: string
           max_points?: number
@@ -256,6 +267,7 @@ export type Database = {
         Update: {
           assignment_id?: string
           criterion?: string
+          criteria_file_path?: string | null
           description?: string | null
           id?: string
           max_points?: number

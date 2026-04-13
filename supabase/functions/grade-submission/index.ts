@@ -6,169 +6,367 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+function cleanText(text: string) {
+  return text
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, " ")
+    .trim();
+}
+
+function truncate(text: string | null | undefined, max = 500) {
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}...[truncated]` : text;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseGeminiResponse(rawText: string, rubrics: any[]) {
+  const cleaned = cleanText(rawText);
 
   try {
-    const { submissionId } = await req.json();
-    if (!submissionId) throw new Error("submissionId is required");
+    return JSON.parse(cleaned);
+  } catch {
+    console.log("JSON parse failed, attempting recovery");
+
+    const gradeRegex =
+      /"criterion_index"\s*:\s*(\d+)[\s\S]*?"score"\s*:\s*(\d+)[\s\S]*?"feedback"\s*:\s*"([\s\S]*?)"/g;
+
+    const grades: any[] = [];
+    let match: RegExpExecArray | null;
+
+    while ((match = gradeRegex.exec(cleaned)) !== null) {
+      const index = Number(match[1]);
+      const score = Number(match[2]);
+      const feedback = match[3].trim();
+
+      if (index >= 0 && index < rubrics.length) {
+        grades.push({
+          criterion_index: index,
+          score: Math.min(Math.max(score, 0), rubrics[index].max_points),
+          feedback: feedback || "Feedback unavailable",
+        });
+      }
+    }
+
+    const unique = grades.filter(
+      (g, i, arr) => arr.findIndex((x) => x.criterion_index === g.criterion_index) === i
+    );
+
+    let overall = "AI grading completed.";
+    const overallMatch = cleaned.match(/"overall_feedback"\s*:\s*"([\s\S]*?)"/);
+    if (overallMatch) {
+      overall = overallMatch[1].trim();
+    }
+
+    if (unique.length === 0) {
+      return {
+        grades: rubrics.map((_: any, i: number) => ({
+          criterion_index: i,
+          score: 0,
+          feedback: "AI response incomplete. Please retry grading.",
+        })),
+        overall_feedback: "AI response incomplete. Please retry grading.",
+      };
+    }
+
+    return { grades: unique, overall_feedback: overall };
+  }
+}
+
+async function callGemini(geminiKey: string, prompt: string) {
+  const models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.2,
+              maxOutputTokens: 2200,
+            },
+            systemInstruction: {
+              parts: [
+                {
+                  text: "You are an expert programming assignment grader. Return strict valid JSON only. Give detailed, specific, rubric-based feedback that identifies exact mistakes, missing parts, logic issues, edge-case issues, syntax issues, and how to improve them.",
+                },
+              ],
+            },
+          }),
+        }
+      );
+
+      if (resp.ok) {
+        const data = await resp.json();
+        console.log(`Gemini success with ${model}`);
+        return { ok: true, data, model };
+      }
+
+      const errText = await resp.text();
+      console.error(`${model} error attempt ${attempt + 1}:`, errText);
+
+      if (resp.status === 503) {
+        if (attempt < 2) {
+          await sleep(1000 * Math.pow(2, attempt));
+          continue;
+        }
+        break;
+      }
+
+      if (resp.status === 429) {
+        return { ok: false, status: 429, errorText: errText, model };
+      }
+
+      if (resp.status === 404) {
+        break;
+      }
+
+      return { ok: false, status: resp.status, errorText: errText, model };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 503,
+    errorText: "All Gemini models temporarily unavailable.",
+    model: null,
+  };
+}
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  let submissionId: string | null = null;
+  let supabase: any = null;
+
+  try {
+    console.log("grade-submission called");
+
+    const body = await req.json();
+    submissionId = body.submissionId;
+
+    if (!submissionId) {
+      throw new Error("Missing submissionId");
+    }
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const geminiKey = Deno.env.get("GEMINI_API_KEY");
-    if (!geminiKey) throw new Error("GEMINI_API_KEY not configured");
 
-    const supabase = createClient(supabaseUrl, serviceKey);
+    if (!geminiKey) {
+      throw new Error("Missing Gemini API key");
+    }
 
-    // Update status to grading
-    await supabase.from("submissions").update({ status: "grading" }).eq("id", submissionId);
+    supabase = createClient(supabaseUrl, serviceKey);
 
-    // Get submission with assignment
-    const { data: submission, error: subErr } = await supabase
-      .from("submissions").select("*, assignments(*)").eq("id", submissionId).single();
-    if (subErr || !submission) throw new Error("Submission not found");
+    await supabase
+      .from("submissions")
+      .update({ status: "grading" })
+      .eq("id", submissionId);
 
-    // Get rubrics
-    const { data: rubrics } = await supabase
-      .from("rubrics").select("*").eq("assignment_id", submission.assignment_id).order("sort_order");
-    if (!rubrics?.length) throw new Error("No rubrics found");
+    const { data: submission, error: submissionError } = await supabase
+      .from("submissions")
+      .select("*, assignments(*)")
+      .eq("id", submissionId)
+      .single();
+
+    if (submissionError || !submission) {
+      throw new Error("Submission not found");
+    }
+
+    const { data: rubrics, error: rubricError } = await supabase
+      .from("rubrics")
+      .select("*")
+      .eq("assignment_id", submission.assignment_id)
+      .order("sort_order");
+
+    if (rubricError || !rubrics?.length) {
+      throw new Error("Rubrics not found");
+    }
 
     const assignment = submission.assignments;
-    let codeOutput = "";
-    let codeSuccess = false;
 
-    // For code assignments, try to execute the code
-    if (assignment.type === "code" && submission.code_content) {
-      try {
-        const execResp = await fetch(`${supabaseUrl}/functions/v1/execute-code`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${serviceKey}`,
-          },
-          body: JSON.stringify({
-            code: submission.code_content,
-            language: assignment.programming_language || "python",
-          }),
-        });
-        const execResult = await execResp.json();
-        codeOutput = execResult.output || execResult.error || "";
-        codeSuccess = execResult.success ?? false;
-      } catch (e) {
-        codeOutput = `Execution error: ${e.message}`;
-        codeSuccess = false;
-      }
-    }
-
-    // Build grading prompt
-    const rubricText = rubrics.map((r, i) =>
-      `${i + 1}. "${r.criterion}" (max ${r.max_points} points): ${r.description || "No description"}`
-    ).join("\n");
+    const rubricText = rubrics
+      .map((r: any, i: number) => {
+        return `${i}. Criterion: ${r.criterion}
+Max points: ${r.max_points}
+Description: ${r.description || "No description provided"}`;
+      })
+      .join("\n\n");
 
     let submissionContent = "";
-    if (assignment.type === "text") submissionContent = submission.text_content || "";
-    else if (assignment.type === "code") {
-      submissionContent = `Code:\n\`\`\`\n${submission.code_content}\n\`\`\`\n\nCode Output:\n${codeOutput}\nExecution Success: ${codeSuccess}`;
-    } else if (assignment.type === "file") {
-      submissionContent = `File submitted at: ${submission.file_url}`;
+
+    if (assignment.type === "code") {
+      submissionContent = `Student code:
+${truncate(submission.code_content, 2500)}
+
+Programming language: ${assignment.programming_language || "python"}
+
+Important grading note:
+- Identify exact mistakes in logic, syntax, missing edge cases, formatting, or incomplete implementation.
+- Mention specific lines or code behavior when possible.
+- Explain what the student should change to improve the solution.`;
+    } else if (assignment.type === "text") {
+      submissionContent = truncate(submission.text_content, 1800);
+    } else {
+      submissionContent = `Student submitted a file: ${submission.file_url || "No file URL available"}`;
     }
 
-    const prompt = `You are an AI grading assistant. Grade the following student submission based on the rubric criteria.
+    const prompt = `You are grading a student submission using the rubric below.
 
-Assignment: ${assignment.title}
-Description: ${assignment.description || "N/A"}
-Type: ${assignment.type}
-${assignment.programming_language ? `Language: ${assignment.programming_language}` : ""}
+Assignment Title:
+${assignment.title || "Untitled Assignment"}
 
-Rubric Criteria:
+Assignment Description:
+${assignment.description || "No description provided"}
+
+Rubrics:
 ${rubricText}
 
-Student Submission:
+Submission:
 ${submissionContent}
 
-IMPORTANT: For code assignments, evaluate the LOGIC and ALGORITHM, not just syntax. The student can use any valid approach (while loop, for loop, recursion, etc.) as long as the algorithm is correct.
+Instructions:
+- Grade each rubric criterion independently.
+- For each criterion, explain the student's exact mistake or what they did correctly.
+- If something is missing, clearly say what is missing.
+- For code submissions, mention incorrect logic, syntax problems, edge-case issues, wrong output formatting, or incomplete implementation.
+- If the student did something correctly, explain exactly what is correct.
+- Feedback must be specific and useful, not generic.
+- Each criterion feedback should be 2 to 4 sentences.
+- overall_feedback should be 3 to 5 sentences summarizing strengths, mistakes, and how to improve.
+- Return ONLY valid JSON.
+- Do not use markdown.
+- Do not use code fences.
 
-Respond ONLY with a valid JSON object in this exact format (no markdown, no extra text):
+Format:
 {
   "grades": [
     {
       "criterion_index": 0,
-      "score": <number>,
-      "feedback": "<specific feedback for this criterion>"
+      "score": 0,
+      "feedback": "Detailed feedback here"
     }
   ],
-  "overall_feedback": "<overall feedback for the student>"
-}
+  "overall_feedback": "Detailed overall feedback here"
+}`;
 
-Grade each criterion independently. criterion_index is 0-based.`;
+    const geminiResult = await callGemini(geminiKey, prompt);
 
-    // Call Gemini API
-    const geminiResp = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.2,
-          },
-          systemInstruction: {
-            parts: [{ text: "You are an expert grading assistant. Be fair, thorough, and constructive. Always respond with valid JSON only." }],
-          },
-        }),
+    if (!geminiResult.ok) {
+      if (geminiResult.status === 429) {
+        await supabase
+          .from("submissions")
+          .update({
+            status: "submitted",
+            ai_feedback: "AI quota exceeded. Please try again later.",
+          })
+          .eq("id", submissionId);
+
+        return new Response(
+          JSON.stringify({ success: false, error: "Quota exceeded" }),
+          {
+            status: 200,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
-    );
 
-    if (!geminiResp.ok) {
-      const errText = await geminiResp.text();
-      if (geminiResp.status === 429) throw new Error("Rate limited. Please try again later.");
-      throw new Error(`Gemini API error: ${errText}`);
+      if (geminiResult.status === 503) {
+        await supabase
+          .from("submissions")
+          .update({
+            status: "submitted",
+            ai_feedback: "AI is temporarily busy. Please retry shortly.",
+          })
+          .eq("id", submissionId);
+
+        return new Response(
+          JSON.stringify({ success: false, error: "AI temporarily unavailable" }),
+          {
+            status: 200,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      throw new Error(geminiResult.errorText || "Gemini request failed");
     }
 
-    const geminiData = await geminiResp.json();
-    const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!rawText) throw new Error("Gemini did not return grading results");
+    const rawText = geminiResult.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) {
+      throw new Error("Empty Gemini response");
+    }
 
-    const gradingResult = JSON.parse(rawText);
+    const result = parseGeminiResponse(rawText, rubrics);
 
-    // Insert grades
-    let totalScore = 0;
-    let maxPossible = 0;
-    for (const g of gradingResult.grades) {
+    await supabase.from("grades").delete().eq("submission_id", submissionId);
+
+    let total = 0;
+    let max = 0;
+
+    for (const g of result.grades) {
       const rubric = rubrics[g.criterion_index];
       if (!rubric) continue;
-      const score = Math.min(Math.max(0, g.score), rubric.max_points);
-      totalScore += score;
-      maxPossible += rubric.max_points;
+
+      const score = Math.min(Math.max(Number(g.score) || 0, 0), rubric.max_points);
+      total += score;
+      max += rubric.max_points;
+
       await supabase.from("grades").insert({
         submission_id: submissionId,
         rubric_id: rubric.id,
         score,
-        feedback: g.feedback,
+        feedback: truncate(g.feedback, 1200),
       });
     }
 
-    // Update submission
-    await supabase.from("submissions").update({
-      status: "graded",
-      total_score: totalScore,
-      max_possible_score: maxPossible,
-      ai_feedback: gradingResult.overall_feedback,
-      code_output: codeOutput || null,
-      code_execution_success: assignment.type === "code" ? codeSuccess : null,
-      graded_at: new Date().toISOString(),
-    }).eq("id", submissionId);
+    await supabase
+      .from("submissions")
+      .update({
+        status: "graded",
+        total_score: total,
+        max_possible_score: max,
+        ai_feedback: truncate(result.overall_feedback, 2000),
+      })
+      .eq("id", submissionId);
 
-    return new Response(JSON.stringify({ success: true, totalScore, maxPossible }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
-  } catch (e) {
-    console.error("grade-submission error:", e);
-    return new Response(JSON.stringify({ error: e.message }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({ success: true, total, max }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  } catch (e: any) {
+    console.error("Error:", e);
+
+    if (supabase && submissionId) {
+      await supabase
+        .from("submissions")
+        .update({
+          status: "submitted",
+          ai_feedback: "Grading could not be completed. Please retry.",
+        })
+        .eq("id", submissionId);
+    }
+
+    return new Response(
+      JSON.stringify({ error: e.message }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
   }
 });

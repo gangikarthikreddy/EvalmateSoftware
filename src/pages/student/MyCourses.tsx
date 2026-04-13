@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
@@ -9,9 +9,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { toast } from "sonner";
 import type { Tables } from "@/integrations/supabase/types";
 
+type EnrollmentRow = Tables<"course_enrollments"> & { courses: Tables<"courses"> };
+
 export default function MyCourses() {
   const { user } = useAuth();
-  const [enrollments, setEnrollments] = useState<(Tables<"course_enrollments"> & { courses: Tables<"courses"> })[]>([]);
+  const [enrollments, setEnrollments] = useState<EnrollmentRow[]>([]);
   const [assignments, setAssignments] = useState<Record<string, Tables<"assignments">[]>>({});
   const [enrollCode, setEnrollCode] = useState("");
   const [open, setOpen] = useState(false);
@@ -21,15 +23,17 @@ export default function MyCourses() {
     const { data: enr } = await supabase.from("course_enrollments").select("*, courses(*)").eq("student_id", user.id);
     setEnrollments((enr as any) || []);
     const courseIds = (enr || []).map((e: any) => e.course_id);
-    if (courseIds.length) {
-      const { data: a } = await supabase.from("assignments").select("*").in("course_id", courseIds).order("due_date");
-      const grouped: Record<string, Tables<"assignments">[]> = {};
-      (a || []).forEach(assignment => {
-        if (!grouped[assignment.course_id]) grouped[assignment.course_id] = [];
-        grouped[assignment.course_id].push(assignment);
-      });
-      setAssignments(grouped);
+    if (!courseIds.length) {
+      setAssignments({});
+      return;
     }
+    const { data: a } = await supabase.from("assignments").select("*").in("course_id", courseIds).order("due_date");
+    const grouped: Record<string, Tables<"assignments">[]> = {};
+    (a || []).forEach((assignment: any) => {
+      if (!grouped[assignment.course_id]) grouped[assignment.course_id] = [];
+      grouped[assignment.course_id].push(assignment);
+    });
+    setAssignments(grouped);
   };
 
   useEffect(() => { load(); }, [user]);
@@ -41,11 +45,21 @@ export default function MyCourses() {
     if (!course) { toast.error("Course not found"); return; }
     const { error } = await supabase.from("course_enrollments").insert({ course_id: course.id, student_id: user.id });
     if (error) { toast.error(error.message.includes("duplicate") ? "Already enrolled" : error.message); return; }
-    toast.success("Enrolled!");
+    toast.success("Enrolled");
     setOpen(false);
     setEnrollCode("");
     load();
   };
+
+  const unenroll = async (enrollmentId: string, courseTitle: string) => {
+    if (!window.confirm(`Unenroll from ${courseTitle}?`)) return;
+    const { error } = await supabase.from("course_enrollments").delete().eq("id", enrollmentId);
+    if (error) { toast.error(error.message); return; }
+    toast.success("Unenrolled");
+    load();
+  };
+
+  const sortedEnrollments = useMemo(() => [...enrollments].sort((a, b) => a.courses.title.localeCompare(b.courses.title)), [enrollments]);
 
   return (
     <div>
@@ -64,11 +78,16 @@ export default function MyCourses() {
       </div>
 
       <div className="space-y-6">
-        {enrollments.map((enr: any) => (
+        {sortedEnrollments.map((enr: any) => (
           <Card key={enr.id}>
             <CardHeader>
-              <div className="text-xs text-muted-foreground font-mono">{enr.courses.code}</div>
-              <CardTitle>{enr.courses.title}</CardTitle>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-xs text-muted-foreground font-mono">{enr.courses.code}</div>
+                  <CardTitle>{enr.courses.title}</CardTitle>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => unenroll(enr.id, enr.courses.title)}>Unenroll</Button>
+              </div>
             </CardHeader>
             <CardContent>
               <div className="space-y-2">
@@ -82,7 +101,7 @@ export default function MyCourses() {
                           {a.due_date && ` · Due ${new Date(a.due_date).toLocaleDateString()}`}
                         </div>
                       </div>
-                      <Button variant="ghost" size="sm">Submit →</Button>
+                      <Button variant="ghost" size="sm">Open →</Button>
                     </div>
                   </Link>
                 ))}
@@ -91,7 +110,7 @@ export default function MyCourses() {
             </CardContent>
           </Card>
         ))}
-        {enrollments.length === 0 && <p className="text-muted-foreground text-center py-12">Not enrolled in any courses. Join one using a course code!</p>}
+        {sortedEnrollments.length === 0 && <p className="text-muted-foreground text-center py-12">Not enrolled in any courses. Join one using a course code.</p>}
       </div>
     </div>
   );
